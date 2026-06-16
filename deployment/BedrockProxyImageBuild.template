@@ -1,0 +1,142 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Image build for Bedrock Access Gateway (Lambda). Creates an ECR repo, an S3
+  source bucket, and a CodeBuild project that builds the ARM64 Lambda container
+  image from src/Dockerfile and pushes it to ECR. No local Docker required.
+  Driven end-to-end by scripts/deploy-vpc.sh.
+
+Parameters:
+  RepoName:
+    Type: String
+    Default: bedrock-proxy-api
+
+Resources:
+  EcrRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref RepoName
+      ImageScanningConfiguration: {ScanOnPush: true}
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [{
+              "rulePriority": 1,
+              "description": "keep last 5 images",
+              "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 5},
+              "action": {"type": "expire"}
+            }]
+          }
+
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-src-${AWS::AccountId}"
+      VersioningConfiguration: {Status: Enabled}
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/codebuild/${AWS::StackName}"
+      RetentionInDays: 7
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codebuild.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build-perms
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub "${SourceBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt EcrRepo.Arn
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-build"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts: {Type: NO_ARTIFACTS}
+      Environment:
+        # ARM container build image so the Lambda image is arm64 (matches the
+        # template's Architectures: arm64).
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-aarch64-standard:3.0
+        PrivilegedMode: true   # needed for docker
+        EnvironmentVariables:
+          - {Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region}
+          - {Name: AWS_ACCOUNT_ID,    Value: !Ref AWS::AccountId}
+          - {Name: ECR_REPO_NAME,     Value: !Ref RepoName}
+          - {Name: ECR_URI,           Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${RepoName}"}
+      Source:
+        Type: S3
+        Location: !Sub "${SourceBucket}/src.zip"
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to ECR...
+                - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+            build:
+              commands:
+                - echo Building Lambda image from src/Dockerfile ...
+                - docker build -f src/Dockerfile -t "$ECR_URI:latest" src
+            post_build:
+              commands:
+                - echo Pushing to ECR...
+                - docker push "$ECR_URI:latest"
+                - echo "Pushed $ECR_URI:latest"
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CodeBuildLogGroup
+      TimeoutInMinutes: 20
+
+Outputs:
+  EcrUri:
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${RepoName}"
+    Description: ECR URI (append :latest) for ContainerImageUri in the main stack
+  SourceBucket:
+    Value: !Ref SourceBucket
+  CodeBuildProjectName:
+    Value: !Ref CodeBuildProject

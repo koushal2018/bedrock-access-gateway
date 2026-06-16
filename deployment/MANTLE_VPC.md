@@ -10,8 +10,32 @@
 >    and fails fast with exact remediation if something is missing.
 
 This guide is the complete, follow-along procedure for deploying into an
-**existing private VPC**. Read [§0 Concepts](#0-concepts) first — it explains the
-one thing that most commonly breaks this deployment.
+**existing private VPC**.
+
+---
+
+## Quick start (one command)
+
+If your VPC already has the [prerequisites](#1-prerequisites-create-these-in-your-vpc-first)
+(private subnets, security groups, and VPC endpoints), this script does
+everything else — builds the image in-account (no local Docker), creates the
+secret, and deploys the gateway. **Preflight will tell you exactly what's missing
+if a prerequisite isn't there**, so it's safe to just run it and see:
+
+```bash
+git clone https://github.com/koushal2018/bedrock-access-gateway.git
+cd bedrock-access-gateway
+./scripts/deploy-vpc.sh
+```
+
+It prompts for: region, VPC id, private subnet ids, Lambda security group id,
+default model, and an API key. (You can also pre-set those as env vars — see the
+top of the script.) On success it prints the API base URL and ready-to-run test
+commands.
+
+Prefer to do it by hand or understand each piece? The full manual procedure is
+below. **Read [§0 Concepts](#0-concepts) first — it explains the one thing that
+most commonly breaks this deployment.**
 
 ---
 
@@ -127,17 +151,19 @@ aws ec2 create-vpc-endpoint --region <region> \
 The Lambda is a **container image** (`src/Dockerfile`, **arm64**). Build it in
 your account and push to ECR.
 
-### Option A — AWS CodeBuild (no local Docker required)
-This fork includes a CodeBuild bootstrap you can adapt, but the minimal manual
-path is:
-```bash
-# 1. Create the ECR repo
-aws ecr create-repository --repository-name bedrock-proxy-api --region <region>
+### Option A — AWS CodeBuild (no local Docker required) — recommended
+`scripts/deploy-vpc.sh` (see [Quick start](#quick-start-one-command)) does this
+for you via `deployment/BedrockProxyImageBuild.template` (creates an ECR repo +
+an ARM CodeBuild project, zips `src/`, builds and pushes
+`<account>.dkr.ecr.<region>.amazonaws.com/bedrock-proxy-api:latest`).
 
-# 2. Create a CodeBuild project using an ARM image (aws/codebuild/amazonlinux2-aarch64-standard:3.0),
-#    PrivilegedMode=true, source = this repo, with a buildspec that runs:
-#      docker build -f src/Dockerfile -t <ecr-uri>:latest src
-#      docker push <ecr-uri>:latest
+To run just the image build yourself:
+```bash
+aws cloudformation deploy --region <region> --stack-name bedrock-proxy-imagebuild \
+  --template-file deployment/BedrockProxyImageBuild.template --capabilities CAPABILITY_IAM
+# then upload src and start the build (the script automates these two lines):
+#   zip -qr src.zip src && aws s3 cp src.zip s3://<SourceBucket-from-outputs>/src.zip
+#   aws codebuild start-build --project-name <CodeBuildProjectName-from-outputs>
 ```
 (If your org builds images through a security-scanned pipeline / Nexus and then
 promotes to ECR, use that — the gateway only needs the final image in an ECR
