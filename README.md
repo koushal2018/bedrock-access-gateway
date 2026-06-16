@@ -64,12 +64,18 @@ The following diagram illustrates the reference architecture. It uses [Amazon AP
 
 ### Deployment Options
 
-| Option | Pros | Cons | Best For |
-|--------|------|------|----------|
-| **API Gateway + Lambda** | No VPC required, pay-per-request, native streaming support, lower operational overhead | Potential cold starts | Most use cases, cost-sensitive deployments |
-| **ALB + Fargate** | Lowest streaming latency, no cold starts | Higher cost, requires VPC | High-throughput, latency-sensitive workloads |
+| Option | Template | Pros | Cons | Best For |
+|--------|----------|------|------|----------|
+| **API Gateway + Lambda** | `deployment/BedrockProxy.template` | No VPC required, pay-per-request, native streaming support, lower operational overhead | Potential cold starts | Most use cases, cost-sensitive deployments |
+| **ALB + Fargate** | `deployment/BedrockProxyFargate.template` | Lowest streaming latency, no cold starts | Higher cost, requires VPC | High-throughput, latency-sensitive workloads |
+| **API Gateway + Lambda, in an existing VPC** ⭐ *(this fork)* | `deployment/BedrockProxyVpc.template` | Runs the Lambda **inside your VPC** reaching Bedrock over **private VPC endpoints**; **preflight** validates prerequisites and fails fast with exact remediation; **Mantle routing** built in | Requires the VPC endpoints + SG wiring described below | Private/regulated environments that must keep traffic off the public internet |
 
 You can also use Lambda Function URL as an alternative, see [example](https://github.com/awslabs/aws-lambda-web-adapter/tree/main/examples/fastapi-response-streaming)
+
+> **Which one for the private-VPC + Mantle use case?** Use
+> **`BedrockProxyVpc.template`** and follow [its detailed guide in
+> `deployment/MANTLE_VPC.md`](deployment/MANTLE_VPC.md). The steps below cover
+> the two upstream (non-VPC) options.
 
 ### Deployment
 
@@ -98,9 +104,9 @@ After creation, you'll see your secret in the Secrets Manager console. Make note
 
 **Step 2: Build and push container images to ECR**
 
-1. Clone this repository:
+1. Clone this repository (this fork):
    ```bash
-   git clone https://github.com/aws-samples/bedrock-access-gateway.git
+   git clone https://github.com/koushal2018/bedrock-access-gateway.git
    cd bedrock-access-gateway
    ```
 
