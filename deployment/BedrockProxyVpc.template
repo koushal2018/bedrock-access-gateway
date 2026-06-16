@@ -1,0 +1,437 @@
+Description: >
+  Bedrock Access Gateway (Lambda + API Gateway, streaming) deployed INSIDE an
+  EXISTING VPC, with a PREFLIGHT check that validates your VPC prerequisites
+  before anything is created and fails fast with exact remediation if something
+  is missing. Owns only the Lambda, its API Gateway, IAM, and the preflight
+  resource — it does NOT create VPC endpoints, subnets, or routing. Routes
+  OpenAI-compatible models to the bedrock-mantle endpoint and everything else to
+  bedrock-runtime / Converse.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: "1. Application"}
+        Parameters: [ContainerImageUri, ApiKeySecretArn, DefaultModelId]
+      - Label: {default: "2. VPC placement (pick from your existing resources)"}
+        Parameters: [VpcId, PrivateSubnetIds, LambdaSecurityGroupId]
+      - Label: {default: "3. Feature toggles"}
+        Parameters: [EnableMantle, MantleRegion, EnableCrossRegionInference, EnablePromptCaching]
+      - Label: {default: "4. Preflight"}
+        Parameters: [RequireNatlessImagePullEndpoints, SkipPreflight]
+    ParameterLabels:
+      ContainerImageUri: {default: "ECR image URI (arm64)"}
+      ApiKeySecretArn: {default: "API key secret ARN (JSON with key 'api_key')"}
+      DefaultModelId: {default: "Default model ID (must exist in this region)"}
+      VpcId: {default: "VPC"}
+      PrivateSubnetIds: {default: "Private subnets (>= 2 distinct AZs)"}
+      LambdaSecurityGroupId: {default: "Lambda security group"}
+      EnableMantle: {default: "Route Mantle models to bedrock-mantle?"}
+      MantleRegion: {default: "Mantle region (blank = this region)"}
+      EnableCrossRegionInference: {default: "Advertise cross-region (us./eu./global.) profiles?"}
+      EnablePromptCaching: {default: "Enable prompt caching?"}
+      RequireNatlessImagePullEndpoints: {default: "Subnets have NO NAT (require ECR+S3 endpoints)?"}
+      SkipPreflight: {default: "Skip preflight checks (not recommended)"}
+
+Parameters:
+  ContainerImageUri:
+    Type: String
+    Description: ECR image URI (e.g. 123456789012.dkr.ecr.ap-south-1.amazonaws.com/bedrock-proxy-api:latest)
+  ApiKeySecretArn:
+    Type: String
+    AllowedPattern: ^arn:aws:secretsmanager:.*$
+    Description: Secret ARN in Secrets Manager (JSON with key "api_key").
+  DefaultModelId:
+    Type: String
+    Default: anthropic.claude-3-sonnet-20240229-v1:0
+    Description: Default model for clients that omit "model" or send gpt-*. Preflight verifies it exists in this region.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC to deploy into (dropdown of your VPCs).
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets in >= 2 distinct AZs, at most one per AZ (dropdown of your subnets).
+  LambdaSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group for the Lambda. Your VPC endpoints' SGs must allow inbound 443 from this SG.
+  EnableMantle:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  MantleRegion:
+    Type: String
+    Default: ""
+    Description: Region for bedrock-mantle. Blank = this stack's region.
+  EnableCrossRegionInference:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Keep "false" for a single-region private VPC (a regional bedrock-runtime endpoint only serves THIS region).
+  EnablePromptCaching:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  RequireNatlessImagePullEndpoints:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: If your private subnets have no NAT, preflight also requires ecr.api, ecr.dkr and an S3 gateway endpoint (needed to pull the Lambda image). Set "false" only if your subnets have NAT egress.
+  SkipPreflight:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Bypass the preflight validation. Not recommended.
+
+Conditions:
+  UseStackRegionForMantle: !Equals [!Ref MantleRegion, ""]
+
+Resources:
+  # =========================================================================
+  # PREFLIGHT — validates the VPC prerequisites and FAILS THE STACK with a
+  # clear message if anything is missing, BEFORE the gateway Lambda is created.
+  # =========================================================================
+  PreflightFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: preflight-readonly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeVpcEndpoints
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSecurityGroupRules
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcAttribute
+                  - bedrock:ListFoundationModels
+                  - bedrock:ListInferenceProfiles
+                Resource: "*"
+              # sts:GetCallerIdentity needs no resource/permission, but listed for clarity.
+
+  PreflightFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt PreflightFnRole.Arn
+      Code:
+        ZipFile: |
+          import json, urllib.request, threading, traceback, boto3
+
+          # send() NEVER raises — a custom resource that fails to respond hangs
+          # the stack for the full ~1h timeout, which is worse than any check.
+          def send(event, status, reason):
+              try:
+                  body = json.dumps({
+                      "Status": status, "Reason": str(reason)[:1000],
+                      "PhysicalResourceId": event.get("PhysicalResourceId") or event.get("LogicalResourceId", "preflight"),
+                      "StackId": event["StackId"], "RequestId": event["RequestId"],
+                      "LogicalResourceId": event["LogicalResourceId"], "Data": {},
+                  }).encode()
+                  req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                               headers={"content-type": "", "content-length": str(len(body))})
+                  urllib.request.urlopen(req, timeout=15)
+              except Exception as e:
+                  print(f"send() failed (stack may hang): {e}")
+
+          def port_ok(r):
+              # -1 / absent FromPort means "all ports". Otherwise 443 must fall in [From,To].
+              fp = r.get("FromPort", -1); tp = r.get("ToPort", -1)
+              if fp in (-1, None):
+                  return True
+              return fp <= 443 <= (tp if tp not in (-1, None) else fp)
+
+          def checks(p):
+              region = p["Region"]; vpc = p["VpcId"]
+              subnet_ids = p["SubnetIds"]; lambda_sg = p["LambdaSecurityGroupId"]
+              enable_mantle = p.get("EnableMantle", "true") == "true"
+              need_natless = p.get("RequireNatlessImagePullEndpoints", "true") == "true"
+              default_model = p.get("DefaultModelId", "")
+              ec2 = boto3.client("ec2", region_name=region)
+              sts = boto3.client("sts", region_name=region)
+              problems = []; warnings = []
+              def svc(short): return f"com.amazonaws.{region}.{short}"
+
+              # Is this account the VPC owner? In a shared VPC we can't see
+              # endpoints/SGs owned by the networking account, so "missing" there
+              # is unknowable -> warn, don't hard-fail (avoids false negatives).
+              owns_vpc = True
+              try:
+                  acct = sts.get_caller_identity()["Account"]
+                  v = ec2.describe_vpcs(VpcIds=[vpc])["Vpcs"][0]
+                  owns_vpc = (v.get("OwnerId") == acct)
+              except Exception as e:
+                  warnings.append(f"Could not determine VPC ownership ({e}); endpoint checks may be incomplete in a shared VPC.")
+
+              def miss(msg):
+                  (warnings if not owns_vpc else problems).append(
+                      msg + ("" if owns_vpc else " [shared VPC: verify in the owning account]"))
+
+              # 1. VPC DNS attributes.
+              try:
+                  for attr, key in (("enableDnsSupport", "EnableDnsSupport"), ("enableDnsHostnames", "EnableDnsHostnames")):
+                      if not ec2.describe_vpc_attribute(VpcId=vpc, Attribute=attr)[key]["Value"]:
+                          problems.append(f"VPC {vpc} has {attr}=false; set it true (required for endpoint private DNS).")
+              except Exception as e:
+                  warnings.append(f"Could not read VPC DNS attributes: {e}")
+
+              # 2. Subnets in distinct AZs.
+              try:
+                  azs = [s["AvailabilityZone"] for s in ec2.describe_subnets(SubnetIds=subnet_ids)["Subnets"]]
+                  if len(set(azs)) != len(azs):
+                      problems.append(f"PrivateSubnetIds must be in distinct AZs; got {azs}.")
+              except Exception as e:
+                  problems.append(f"Could not describe subnets {subnet_ids}: {e}")
+
+              # 3. Required interface endpoints present / available / private DNS.
+              by_svc = {}
+              try:
+                  for e in ec2.describe_vpc_endpoints(Filters=[{"Name": "vpc-id", "Values": [vpc]}])["VpcEndpoints"]:
+                      by_svc[e["ServiceName"]] = e
+              except Exception as e:
+                  warnings.append(f"Could not list VPC endpoints: {e}")
+              required = ["bedrock", "bedrock-runtime", "secretsmanager"]
+              if enable_mantle: required.append("bedrock-mantle")
+              if need_natless:  required += ["ecr.api", "ecr.dkr"]
+              for short in required:
+                  e = by_svc.get(svc(short))
+                  if not e:
+                      miss(f"Missing VPC interface endpoint {svc(short)} (create it, PrivateDnsEnabled=true).")
+                      continue
+                  if e.get("State") != "available":
+                      problems.append(f"Endpoint {svc(short)} state={e.get('State')} (must be 'available').")
+                  if not e.get("PrivateDnsEnabled"):
+                      problems.append(f"Endpoint {svc(short)} has PrivateDnsEnabled=false (must be true).")
+              if need_natless and by_svc and not any(
+                      s == svc("s3") and ep.get("VpcEndpointType") == "Gateway" for s, ep in by_svc.items()):
+                  miss(f"Missing S3 GATEWAY endpoint {svc('s3')} (needed to pull the image with no NAT).")
+
+              # 4a. Lambda SG must allow EGRESS 443 (the near side — easy to miss).
+              try:
+                  lr = ec2.describe_security_group_rules(
+                      Filters=[{"Name": "group-id", "Values": [lambda_sg]}])["SecurityGroupRules"]
+                  if not any(r["IsEgress"] and r.get("IpProtocol") in ("-1", "tcp") and port_ok(r) for r in lr):
+                      problems.append(f"Lambda SG {lambda_sg} has no egress rule allowing 443 (cannot reach endpoints).")
+              except Exception as e:
+                  warnings.append(f"Could not read Lambda SG {lambda_sg} egress rules: {e}")
+
+              # 4b. Each endpoint SG must allow INBOUND 443 from the Lambda SG.
+              for short in required:
+                  e = by_svc.get(svc(short))
+                  if not e:
+                      continue
+                  ep_sgs = [g["GroupId"] for g in e.get("Groups", [])]
+                  if not ep_sgs:
+                      continue
+                  try:
+                      rules = ec2.describe_security_group_rules(
+                          Filters=[{"Name": "group-id", "Values": ep_sgs}])["SecurityGroupRules"]
+                  except Exception as ex:
+                      warnings.append(f"Could not read SG rules for {svc(short)} ({ep_sgs}): {ex}")
+                      continue
+                  ok = any(
+                      (not r["IsEgress"]) and r.get("IpProtocol") in ("-1", "tcp") and port_ok(r)
+                      and (r.get("ReferencedGroupInfo", {}).get("GroupId") in (lambda_sg,) + tuple(ep_sgs))
+                      for r in rules)
+                  if not ok:
+                      problems.append(
+                          f"Endpoint {svc(short)} SG(s) {ep_sgs} do not allow inbound 443 from Lambda SG {lambda_sg}.")
+
+              # 5. DefaultModelId available in region (approximate: BAG further
+              #    filters by TEXT modality/lifecycle, so this can over-accept).
+              if default_model and not default_model.lower().startswith("gpt-"):
+                  try:
+                      br = boto3.client("bedrock", region_name=region)
+                      ids = {m["modelId"] for m in br.list_foundation_models().get("modelSummaries", [])}
+                      try:
+                          for pg in br.get_paginator("list_inference_profiles").paginate():
+                              ids |= {x["inferenceProfileId"] for x in pg["inferenceProfileSummaries"]}
+                      except Exception:
+                          pass
+                      if default_model not in ids:
+                          problems.append(f"DefaultModelId '{default_model}' is not available in {region}. Use one from /models.")
+                  except Exception as e:
+                      warnings.append(f"Could not verify DefaultModelId: {e}")
+
+              return problems, warnings
+
+          def handler(event, context):
+              # Deadline net: if checks run long or the runtime kills us, still
+              # respond before the function times out so the stack never hangs.
+              timer = threading.Timer(
+                  max(1, context.get_remaining_time_in_millis() / 1000 - 8),
+                  lambda: send(event, "FAILED", "Preflight timed out before completing."))
+              timer.daemon = True; timer.start()
+              try:
+                  if event["RequestType"] == "Delete":
+                      return send(event, "SUCCESS", "delete noop")
+                  p = event["ResourceProperties"]
+                  if p.get("SkipPreflight", "false") == "true":
+                      return send(event, "SUCCESS", "preflight skipped by parameter")
+                  problems, warnings = checks(p)
+                  tail = ("\nWarnings:\n- " + "\n- ".join(warnings)) if warnings else ""
+                  if problems:
+                      send(event, "FAILED", "Preflight failed:\n- " + "\n- ".join(problems) + tail)
+                  else:
+                      send(event, "SUCCESS", "All prerequisites satisfied." + tail)
+              except Exception:
+                  send(event, "FAILED", "Preflight error: " + traceback.format_exc())
+              finally:
+                  timer.cancel()
+
+  Preflight:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt PreflightFn.Arn
+      Region: !Ref AWS::Region
+      VpcId: !Ref VpcId
+      SubnetIds: !Ref PrivateSubnetIds
+      LambdaSecurityGroupId: !Ref LambdaSecurityGroupId
+      EnableMantle: !Ref EnableMantle
+      RequireNatlessImagePullEndpoints: !Ref RequireNatlessImagePullEndpoints
+      DefaultModelId: !Ref DefaultModelId
+      SkipPreflight: !Ref SkipPreflight
+
+  # =========================================================================
+  # GATEWAY — only created after preflight succeeds (DependsOn).
+  # =========================================================================
+  ProxyApiHandlerServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - {Action: sts:AssumeRole, Effect: Allow, Principal: {Service: lambda.amazonaws.com}}
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+
+  ProxyApiHandlerServiceRoleDefaultPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action: [bedrock:ListFoundationModels, bedrock:ListInferenceProfiles]
+            Effect: Allow
+            Resource: "*"
+          - Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+            Effect: Allow
+            Resource:
+              - arn:aws:bedrock:*::foundation-model/*
+              - arn:aws:bedrock:*:*:inference-profile/*
+              - arn:aws:bedrock:*:*:application-inference-profile/*
+          - Action: [bedrock-mantle:CreateInference, bedrock-mantle:ListModels, bedrock-mantle:GetModel]
+            Effect: Allow
+            Resource: "*"
+          - Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+            Effect: Allow
+            Resource: !Ref ApiKeySecretArn
+        Version: "2012-10-17"
+      PolicyName: ProxyApiHandlerServiceRoleDefaultPolicy
+      Roles: [!Ref ProxyApiHandlerServiceRole]
+
+  # Gateway Lambda waits for Preflight to succeed before it is created, so a
+  # missing prerequisite fails the stack fast instead of as a 250s cold-start
+  # hang. (Preflight always exists; SkipPreflight=true makes it a no-op pass.)
+  ProxyApiHandler:
+    Type: AWS::Lambda::Function
+    DependsOn: [ProxyApiHandlerServiceRoleDefaultPolicy, Preflight]
+    Properties:
+      Architectures: [arm64]
+      Code: {ImageUri: !Ref ContainerImageUri}
+      Description: Bedrock Proxy API Handler with Response Streaming (in-VPC)
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [!Ref LambdaSecurityGroupId]
+      Environment:
+        Variables:
+          AWS_LWA_INVOKE_MODE: RESPONSE_STREAM
+          AWS_LWA_READINESS_CHECK_PATH: /health
+          AWS_LWA_ASYNC_INIT: "true"
+          PORT: "8080"
+          DEBUG: "false"
+          API_KEY_SECRET_ARN: !Ref ApiKeySecretArn
+          DEFAULT_MODEL: !Ref DefaultModelId
+          DEFAULT_EMBEDDING_MODEL: cohere.embed-multilingual-v3
+          ENABLE_CROSS_REGION_INFERENCE: !Ref EnableCrossRegionInference
+          ENABLE_APPLICATION_INFERENCE_PROFILES: "true"
+          ENABLE_PROMPT_CACHING: !Ref EnablePromptCaching
+          ENABLE_MANTLE: !Ref EnableMantle
+          MANTLE_REGION: !If [UseStackRegionForMantle, !Ref "AWS::Region", !Ref MantleRegion]
+          API_ROUTE_PREFIX: /v1
+      MemorySize: 1024
+      PackageType: Image
+      Role: !GetAtt ProxyApiHandlerServiceRole.Arn
+      Timeout: 600
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: BedrockProxyApi
+      Description: Bedrock Access Gateway - OpenAI-compatible API with streaming support
+      EndpointConfiguration: {Types: [REGIONAL]}
+      Body:
+        openapi: "3.0.1"
+        info: {title: BedrockProxyApi, version: "1.0"}
+        paths:
+          /{proxy+}:
+            x-amazon-apigateway-any-method:
+              parameters:
+                - {name: proxy, in: path, required: true, schema: {type: string}}
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2021-11-15/functions/${ProxyApiHandler.Arn}/response-streaming-invocations"
+                passthroughBehavior: when_no_match
+                timeoutInMillis: 600000
+                responseTransferMode: STREAM
+              responses: {default: {description: Default response}}
+          /:
+            x-amazon-apigateway-any-method:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2021-11-15/functions/${ProxyApiHandler.Arn}/response-streaming-invocations"
+                passthroughBehavior: when_no_match
+                timeoutInMillis: 600000
+                responseTransferMode: STREAM
+              responses: {default: {description: Default response}}
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProxyApiHandler
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties: {RestApiId: !Ref RestApi}
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: api
+      Description: API Stage with streaming support
+
+Outputs:
+  APIBaseUrl:
+    Description: Proxy API Base URL (OPENAI_API_BASE)
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/api/v1"
+  RestApiId:
+    Value: !Ref RestApi
+  LambdaFunctionArn:
+    Value: !GetAtt ProxyApiHandler.Arn

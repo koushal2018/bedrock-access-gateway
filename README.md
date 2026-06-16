@@ -2,6 +2,11 @@
 
 OpenAI-compatible RESTful APIs for Amazon Bedrock
 
+> **Fork note:** this fork adds (1) routing of OpenAI-compatible models to
+> Amazon Bedrock's native `bedrock-mantle` endpoint and (2) an in-VPC
+> CloudFormation template with a preflight check. See
+> [`deployment/MANTLE_VPC.md`](deployment/MANTLE_VPC.md).
+
 ## What's New 🔥
 
 **API Gateway Response Streaming Support** - You can now deploy with Amazon API Gateway REST API instead of ALB, enabling true response streaming for better latency and cost optimization. See [Deployment Options](#deployment-options) for details.

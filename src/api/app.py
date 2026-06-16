@@ -1,5 +1,6 @@
 import logging
 import os
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
@@ -7,9 +8,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from mangum import Mangum
+from starlette.concurrency import run_in_threadpool
 
 from api.routers import chat, embeddings, model
-from api.setting import API_ROUTE_PREFIX, DESCRIPTION, SUMMARY, TITLE, VERSION
+from api.setting import API_ROUTE_PREFIX, DESCRIPTION, ENABLE_MANTLE, SUMMARY, TITLE, VERSION
 
 config = {
     "title": TITLE,
@@ -22,7 +24,22 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-app = FastAPI(**config)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Best-effort warm load of the Mantle model set. This is an optimization, not
+    # a correctness guarantee: on runtimes where lifespan doesn't run (e.g.
+    # Lambda + Mangum), the chat router lazily loads the set on first request via
+    # mantle.ensure_models_loaded(), so routing still works either way.
+    if ENABLE_MANTLE:
+        from api.models import mantle
+
+        await run_in_threadpool(mantle.refresh_mantle_models)
+    yield
+
+
+app = FastAPI(lifespan=lifespan, **config)
 
 allowed_origins = os.environ.get("ALLOWED_ORIGINS", "*")
 origins_list = [origin.strip() for origin in allowed_origins.split(",")] if allowed_origins != "*" else ["*"]
