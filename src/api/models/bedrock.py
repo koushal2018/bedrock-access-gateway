@@ -1232,15 +1232,18 @@ class BedrockModel(BaseChatModel):
         return False
 
     def _convert_tool_spec(self, func: Function) -> dict:
-        return {
-            "toolSpec": {
-                "name": func.name,
-                "description": func.description,
-                "inputSchema": {
-                    "json": func.parameters,
-                },
-            }
+        tool_spec = {
+            "name": func.name,
+            "inputSchema": {
+                "json": func.parameters,
+            },
         }
+        # description is optional in the OpenAI tool schema but Bedrock's
+        # Converse toolSpec.description must be a string when present — passing
+        # None fails boto3 param validation with a 500. Omit the key instead.
+        if func.description is not None:
+            tool_spec["description"] = func.description
+        return {"toolSpec": tool_spec}
 
     def _calc_budget_tokens(
         self, max_tokens: int, reasoning_effort: Literal["low", "medium", "high"]
